@@ -4,9 +4,12 @@
 // 個人情報（APIキー・メールアドレス）はスクリプトプロパティで管理
 // 設定: 拡張機能 > Apps Script > プロジェクトの設定 > スクリプト プロパティ
 // 必要なキー: GEMINI_API_KEY, EMAIL_RECIPIENT
-const GMAIL_QUERY = 'label:10_scholar label:unread';
+// オプション: GMAIL_QUERY … 未設定なら下記 DEFAULT_GMAIL_QUERY を使用。Gmailのラベル名と一致しないと検索0件になる。
+// 既定のGmail検索。ラベルにスペースがある場合はスクリプトプロパティで GMAIL_QUERY を指定（例: label:"10 scholar" label:unread）
+const DEFAULT_GMAIL_QUERY = 'label:10_scholar label:unread';
 // メール通知: 送信元・送信先はスクリプトプロパティ EMAIL_RECIPIENT で指定
 // ※トリガーは通知先アカウントで設定すること（送信元＝実行アカウント）
+// レポート出力: シート名「レポート」があればそこに追記。なければアクティブなシート（トリガー実行時は先頭シートになることが多い）
 // ==========================================
 
 function getConfig() {
@@ -21,13 +24,16 @@ function getConfig() {
 
 function main() {
   getConfig(); // スクリプトプロパティ未設定時は即エラー
-  const threads = GmailApp.search(GMAIL_QUERY, 0, 5);
+  var gmailQuery = (PropertiesService.getScriptProperties().getProperty('GMAIL_QUERY') || '').trim() || DEFAULT_GMAIL_QUERY;
+  var threads = GmailApp.search(gmailQuery, 0, 5);
   if (threads.length === 0) {
     console.log("未読メールなし");
     return;
   }
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  // トリガー実行時は「アクティブなシート」が不定のため、名前で指定（なければ従来どおりアクティブシート）
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('レポート') || ss.getActiveSheet();
   const processedThreads = [];
 
   for (const thread of threads) {
@@ -52,7 +58,6 @@ function main() {
         
         // ★フェーズ2：全文取得
         const pageContent = fetchUrlContent(url);
-        
         if (!pageContent || pageContent.length < 500) {
           console.log("中身が取れなかったためスキップ");
           continue;
@@ -62,6 +67,16 @@ function main() {
         const result = analyzeWithGemini(pageContent);
 
         if (result) {
+          // KEYデータに数値が不足している場合は、数値のみ抽出するフォールバックを実行
+          if (!keyEvidenceHasEnoughNumbers(result.key_evidence)) {
+            console.log("KEYデータに数値が不足しているため、数値エビデンスを再抽出します");
+            const numericalOnly = extractNumericalEvidenceOnly(pageContent);
+            if (numericalOnly) {
+              result.key_evidence = result.key_evidence
+                ? result.key_evidence + "\n\n【数値エビデンス補足】\n" + numericalOnly
+                : numericalOnly;
+            }
+          }
           // 論文の原文URLを正しく解決（Scholarリダイレクトから実際のURLを抽出）
           const paperUrl = result.paper_url || resolvePaperUrl(url) || url;
           // 保存
@@ -71,7 +86,7 @@ function main() {
             result.summary_3lines, 
             result.summary_long,
             result.key_evidence,
-            result.credibility,
+            credibilityToDisplayString(result.credibility),
             result.japan_context, 
             result.sns_post, // ここに3つの案がまとめて入ります
             paperUrl,
@@ -140,7 +155,12 @@ function analyzeWithGemini(text) {
   1. タイトル: 結論ズバリのキャッチーな日本語タイトル。
   2. 3行要約: 専門用語を使わず3行で簡潔に。
   3. 500文字要約: 論文の背景、手法、結果、考察を詳細に500文字程度で解説。
-  4. KEYデータ/エビデンス: **具体的な数値を必ず含めること**。要約的な説明ではなく、論文内の実際の数値・割合・効果量・サンプル数・統計値（p値、信頼区間など）を箇条書きで。例：「〇〇群で△△がXX%増加（n=123, p<0.05）」「効果量d=0.8」など。
+  4. KEYデータ/エビデンス（厳守）:
+     - **必ず具体的な数値を含めること。数値のない記述は1つも入れない。**
+     - 各項目は次のいずれかを含むこと: 割合(%), 人数・サンプル数(n=), 効果量(d, OR, RR, HR等), p値, 信頼区間(95%CI), 平均値・標準偏差(M±SD), その他論文に明記された数値。
+     - 良い例: 「介入群で抑うつスコアが23%低下（n=156, p<0.01, 95%CI [-0.8, -0.3]）」「効果量d=0.72」「サンプルは3,200人（女性58%）」
+     - 悪い例: 「効果があった」「多くの人が改善した」「統計的に有意だった」→ これらは数値がないため禁止。
+     - 最低3項目以上、それぞれに数値を入れて箇条書きで出力すること。
   5. 信憑性評価: 以下の3観点で評価すること。
      (1) 掲載媒体と査読: 査読（Peer Review）の有無、インパクトファクター(IF)の有無・水準、ハゲタカジャーナルでないことの確認。
      (2) 著者の属性と所属機関: 著者がその分野の専門家か、信頼できる研究機関（大学・公的機関等）に所属しているか。
@@ -184,6 +204,53 @@ function analyzeWithGemini(text) {
 }
 
 // -------------------------------------------------------
+// KEYデータに数値が十分含まれているか簡易チェック（% or n= or p or 95%CI or d= or 数字）
+// -------------------------------------------------------
+function keyEvidenceHasEnoughNumbers(keyEvidence) {
+  if (!keyEvidence || typeof keyEvidence !== 'string') return false;
+  var s = keyEvidence;
+  // 数値らしきパターン: %, n=, p<, p=, 95%CI, d=, OR=, 小数点・整数
+  var hasPercent = /\d+%|%\s*増加|%\s*減少|%\s*低下/.test(s);
+  var hasN = /n\s*=\s*\d+|N\s*=\s*\d+|サンプル.*\d+/.test(s);
+  var hasP = /p\s*[<>=].*?\d|p\s*<\s*0\.\d+/.test(s);
+  var hasCI = /95%\s*CI|信頼区間|CI\s*[\[\(]/.test(s);
+  var hasEffect = /d\s*=\s*[\d.]+|OR\s*=|RR\s*=|HR\s*=|効果量/.test(s);
+  var hasPlainNumber = (s.match(/\d+\.?\d*/g) || []).length >= 3;
+  return (hasPercent || hasN || hasP || hasCI || hasEffect) && hasPlainNumber;
+}
+
+// -------------------------------------------------------
+// フォールバック：論文テキストから数値エビデンスのみを抽出（KEYデータに数値が足りないとき用）
+// -------------------------------------------------------
+function extractNumericalEvidenceOnly(paperText) {
+  var apiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + getConfig().apiKey;
+  var prompt = `
+以下の論文テキストから、**数値・統計が明記されている事実だけ**を箇条書きで抽出してください。
+各項目には必ず次のいずれかを含めること: 割合(%), サンプル数(n=), p値, 信頼区間(95%CI), 効果量(d, OR, RR等), 平均・標準偏差(M±SD)。
+「効果があった」「有意だった」など数値のない表現は一切含めないでください。5〜10項目、数値付きで出力すること。
+出力はプレーンテキストの箇条書きのみ（JSON不要）。
+
+論文テキスト:
+${(paperText || '').substring(0, 20000)}
+`;
+  try {
+    var payload = { contents: [{ parts: [{ text: prompt }] }] };
+    var response = UrlFetchApp.fetch(apiUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    var data = JSON.parse(response.getContentText());
+    if (data.error || !data.candidates || !data.candidates[0]) return '';
+    var text = data.candidates[0].content.parts[0].text;
+    return (text || '').replace(/^[\s\-・]*/gm, '・').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+// -------------------------------------------------------
 // 共通：Gemini API呼び出し・エラー処理関数
 // -------------------------------------------------------
 function callGeminiAPI(apiUrl, prompt, isArrayExpected) {
@@ -210,8 +277,11 @@ function callGeminiAPI(apiUrl, prompt, isArrayExpected) {
 
     let text = data.candidates[0].content.parts[0].text;
     text = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    // Geminiが文字列値内に改行・タブなどをそのまま出すとJSON.parseが落ちるため、制御文字をスペースに置換
+    text = text.replace(/[\x00-\x1f\x7f]/g, " ");
     
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    return parsed;
 
   } catch (e) {
     console.error("プログラム内部エラー: " + e.toString());
@@ -255,7 +325,6 @@ function resolvePaperUrl(url) {
 // -------------------------------------------------------
 function sendRichEmail(result, url) {
   const { emailRecipient } = getConfig();
-  
   const authors = result.authors || '不明';
   const pubDate = result.publication_date || '不明';
   
@@ -284,7 +353,7 @@ function sendRichEmail(result, url) {
          </div>
          <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; background-color: #fafafa;">
            <strong style="color: #137333;">■ Credibility Check (信憑性)</strong>
-           <p style="margin-top: 5px; font-size: 0.95em;">${escapeHtml(result.credibility)}</p>
+           <p style="margin-top: 5px; font-size: 0.95em; white-space: pre-wrap;">${escapeHtml(credibilityToDisplayString(result.credibility))}</p>
          </div>
       </div>
 
@@ -305,6 +374,25 @@ function sendRichEmail(result, url) {
   `;
   
   GmailApp.sendEmail(emailRecipient, `【厳選レポート】${result.title}`, "", {htmlBody: htmlBody});
+}
+
+// credibility が Gemini からオブジェクトで返った場合に表示用文字列に変換する
+function credibilityToDisplayString(cred) {
+  if (cred === null || cred === undefined) return '';
+  if (typeof cred === 'string') return cred;
+  if (typeof cred === 'object') {
+    var parts = [];
+    for (var key in cred) {
+      if (Object.prototype.hasOwnProperty.call(cred, key)) {
+        var val = cred[key];
+        if (val !== null && val !== undefined && val !== '') {
+          parts.push(key + ': ' + String(val).trim());
+        }
+      }
+    }
+    return parts.length ? parts.join('\n\n') : '';
+  }
+  return String(cred);
 }
 
 // HTMLエスケープ（XSS対策）
