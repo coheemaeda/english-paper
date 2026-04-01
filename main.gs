@@ -78,7 +78,8 @@ function main() {
             }
           }
           // 論文の原文URLを正しく解決（Scholarリダイレクトから実際のURLを抽出）
-          const paperUrl = result.paper_url || resolvePaperUrl(url) || url;
+          // ※ Geminiが推測する result.paper_url は誤URLを返すことがあるため使用しない
+          const paperUrl = resolvePaperUrl(url) || url;
           // 保存
           sheet.appendRow([
             new Date(), 
@@ -168,9 +169,8 @@ function analyzeWithGemini(text) {
   6. 日本の現状との比較: 日本のデータとぶつけ、建設的な提言を含める。
   7. 著者情報: 著者名と所属組織名（論文から抽出、不明な場合は「不明」）。
   8. 公開日: 論文の公開年月日（yyyy/mm/dd形式、不明な場合は「不明」）。
-  9. 論文URL: 本文・メタデータから判明する論文の正規URL（DOIリンク、出版社URL等）。不明な場合は空文字。
-  
-  10. SNS投稿案（3パターン）:
+
+  9. SNS投稿案（3パターン）:
      以下の3つの切り口で、それぞれ投稿案を作成し、**1つのテキストにまとめて**出力してください。
      - 【案1：データ重視】数値や客観的事実を前面に出し、知的好奇心を刺激する。
      - 【案2：共感・当事者重視】親や現場の悩みに寄り添い、安心感や気づきを与える。
@@ -192,8 +192,7 @@ function analyzeWithGemini(text) {
     "japan_context": "...",
     "sns_post": "【案1：データ】\n...\n\n【案2：共感】\n...\n\n【案3：提言】\n...",
     "authors": "著者名・組織名",
-    "publication_date": "yyyy/mm/dd",
-    "paper_url": "論文の正規URL（不明なら空文字）"
+    "publication_date": "yyyy/mm/dd"
   }
 
   論文テキスト:
